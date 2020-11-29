@@ -61,6 +61,7 @@ def sample(
         tokens = []
         logprobs = []
         extra_outputs = []
+        logits = []
         output = self(contexts, act_dtype=act_dtype, **model_call_kwargs)
         past_hidden_state = output["hidden_state"].detach()
         prev_logits = output["logits"][:, -1:, :]
@@ -74,6 +75,7 @@ def sample(
             assert new_logprobs.shape == (n_batch, 1)
             tokens.append(new_tokens)
             logprobs.append(new_logprobs)
+            logits.append(new_logits)
             extra_outputs.append({k: output[k] for k in model_output_keys})
 
             # NOTE: last iteration is thrown away
@@ -81,15 +83,15 @@ def sample(
                 new_tokens, hidden_state=past_hidden_state, act_dtype=act_dtype, **model_call_kwargs
             )
             prev_logits = output["logits"]
-
             past_hidden_state = past_hidden_state.concat_with(output["hidden_state"].detach())
 
         tokens = torch.cat(tokens, dim=1)
         logprobs = torch.cat(logprobs, dim=1)
+        logits = torch.cat(logits, dim=1)
         extra_outputs = {
             k: torch.cat([extra[k] for extra in extra_outputs], dim=1) for k in model_output_keys
         }
-    return dict(tokens=tokens, logprobs=logprobs, **extra_outputs)
+    return dict(tokens=tokens, logprobs=logprobs, logits=logits, **extra_outputs)
 
 
 class ModelWithHeads(torch.nn.Module):
@@ -647,6 +649,7 @@ class QueryResponseModel:
         :return: A dict with structure:
             samples: [batch, num_responses, sample_len]
             logprobs: [batch, num_responses, sample_len]
+            logits: [batch, num_responses, sample_len, n_vocabs]
             [head]: {
                 response: [batch, num_responses, sample_len+1]
             }
@@ -684,14 +687,19 @@ class QueryResponseModel:
 
         samples = results["tokens"]
         logprobs = results["logprobs"]
+        logits = results["logits"]
         assert samples.size(-2) == n_batch * responses_per_query
         assert logprobs.size(-2) == n_batch * responses_per_query
+        assert logits.size(-3) == n_batch * responses_per_query
         assert samples.size(-1) == sample_len, f"{samples.size()} vs {sample_len}"
         assert logprobs.size(-1) == sample_len, f"{logprobs.size()} vs {sample_len}"
+        assert logits.size(-2) == sample_len, f"{logits.size()} vs {sample_len}"
+        assert logits.size(-1) >= torch.max(samples)
         samples = samples.view(n_batch, responses_per_query, sample_len)
         logprobs = logprobs.view(n_batch, responses_per_query, sample_len)
+        logits = logits.view(n_batch, responses_per_query, sample_len, -1)
 
-        output = dict(contexts=context_tokens, samples=samples, logprobs=logprobs)
+        output = dict(contexts=context_tokens, samples=samples, logprobs=logprobs, logits=logits)
 
         mask, _ = _zero_padding_tokens(output["samples"])
         # NOTE: sample doesn't return eval'ed values on final token
