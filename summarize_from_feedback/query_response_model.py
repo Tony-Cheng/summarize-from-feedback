@@ -93,6 +93,58 @@ def sample(
         }
     return dict(tokens=tokens, logprobs=logprobs, logits=logits, **extra_outputs)
 
+def sample_with_partial_response(
+    self,
+    contexts,
+    partial_responses,
+    sample_len,
+    sample_fn,
+    act_dtype=torch.float16,
+    model_output_keys=(),
+    **model_call_kwargs,
+):
+    assert not self.training
+    n_batch, n_ctx = contexts.shape
+    with torch.no_grad():
+        tokens = []
+        logprobs = []
+        extra_outputs = []
+        logits = []
+        output = self(contexts, act_dtype=act_dtype, **model_call_kwargs)
+        past_hidden_state = output["hidden_state"].detach()
+        prev_logits = output["logits"][:, -1:, :]
+        for sample_t in range(n_ctx, n_ctx + sample_len):
+            new = sample_fn(prev_logits)
+            new_tokens, new_logits = new.tokens, new.logits
+
+            # Use tokens from the partial responses
+            new_tokens = partial_responses[:, :, sample_t - n_ctx]
+
+            new_logprobs = -softmax_xent_loss_fn(
+                dict(logits=new_logits.float()), dict(targets=new_tokens), reduction="none"
+            )
+            assert new_tokens.shape == (n_batch, 1)
+            assert new_logprobs.shape == (n_batch, 1)
+            tokens.append(new_tokens)
+            logprobs.append(new_logprobs)
+            logits.append(new_logits)
+            extra_outputs.append({k: output[k] for k in model_output_keys})
+
+            # NOTE: last iteration is thrown away
+            output = self(
+                new_tokens, hidden_state=past_hidden_state, act_dtype=act_dtype, **model_call_kwargs
+            )
+            prev_logits = output["logits"]
+            past_hidden_state = past_hidden_state.concat_with(output["hidden_state"].detach())
+
+        tokens = torch.cat(tokens, dim=1)
+        logprobs = torch.cat(logprobs, dim=1)
+        logits = torch.cat(logits, dim=1)
+        extra_outputs = {
+            k: torch.cat([extra[k] for extra in extra_outputs], dim=1) for k in model_output_keys
+        }
+    return dict(tokens=tokens, logprobs=logprobs, logits=logits, **extra_outputs)
+
 
 class ModelWithHeads(torch.nn.Module):
     def __init__(self, model, scalar_heads, d_model, init_scales=1.0):
@@ -662,9 +714,9 @@ class QueryResponseModel:
         repeated_context_tokens = context_tokens.unsqueeze(1).repeat(1, responses_per_query, 1)
 
         # Combine query and response so far into new query to be passed to _sample()
-        if partial_responses is not None:
-            partial_responses = partial_responses.to(self.device)
-            repeated_context_tokens = torch.cat((repeated_context_tokens, partial_responses), 2)
+        # if partial_responses is not None:
+        #     partial_responses = partial_responses.to(self.device)
+        #     repeated_context_tokens = torch.cat((repeated_context_tokens, partial_responses), 2)
 
         sample_fn = _get_sample_fn(sample_H)
 
@@ -676,14 +728,27 @@ class QueryResponseModel:
             f"context {context_len} and model context_len {self.model_hparams.n_ctx}"
         )
 
-        results = sample(
-            self.model,
-            flat_context_tokens,
-            sample_len=sample_len,
-            sample_fn=sample_fn,
-            model_output_keys=self.heads,
-            **model_call_kwargs,
-        )
+        if partial_responses is not None:
+            sample_len = partial_responses.size(2)
+            results = sample_with_partial_response(
+                self.model,
+                flat_context_tokens,
+                partial_responses,
+                sample_len=sample_len,
+                sample_fn=sample_fn,
+                model_output_keys=self.heads,
+                **model_call_kwargs,
+            )
+        
+        else:
+            results = sample(
+                self.model,
+                flat_context_tokens,
+                sample_len=sample_len,
+                sample_fn=sample_fn,
+                model_output_keys=self.heads,
+                **model_call_kwargs,
+            )
 
         samples = results["tokens"]
         logprobs = results["logprobs"]
